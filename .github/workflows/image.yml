@@ -1,0 +1,78 @@
+# Build the review image this org runs, from an upstream release plus the
+# patches in `patches/`.
+#
+# The image is the fork's whole point: a Docker action that pulls upstream's
+# prebuilt image runs upstream's code and none of the patches. Consumers
+# reference `docker://ghcr.io/ashbywinch/pr-agent:github_action`.
+#
+# The weekly run tries the newest upstream release. If a patch no longer
+# applies, THIS run fails and the published tag is not moved — the failure is
+# the task to adapt the patch, and consumers keep the last good image.
+name: image
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Upstream tag to build from, or 'latest'"
+        default: latest
+        required: false
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the upstream tag
+        id: base
+        run: |
+          git remote add upstream https://github.com/qodo-ai/pr-agent.git
+          git fetch -q --tags --depth 1 upstream
+          requested="${{ inputs.base }}"
+          if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
+            requested=$(git ls-remote --tags --refs upstream \
+              | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          fi
+          echo "tag=$requested" >> "$GITHUB_OUTPUT"
+          echo "building $requested"
+
+      - name: Upstream tree plus the patches
+        run: |
+          tag="${{ steps.base.outputs.tag }}"
+          git checkout -q -B build "$tag"
+          git apply --3way --verbose patches/*.patch
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.github_action
+          push: true
+          # `github_action` moves with each successful build; the versioned tag
+          # is what a consumer pins when it wants a fixed image.
+          tags: |
+            ghcr.io/ashbywinch/pr-agent:github_action
+            ghcr.io/ashbywinch/pr-agent:${{ steps.base.outputs.tag }}-repair1
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.base.outputs.tag }}
