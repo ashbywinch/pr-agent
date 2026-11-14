@@ -84,120 +84,134 @@ index 0000000..9c3374f
 +                         artifact={'response_text': response})
 +    return response
 diff --git a/pr_agent/algo/utils.py b/pr_agent/algo/utils.py
-index 35bf9e0..f7a24f3 100644
+index 5bf2b53..0b33da2 100644
 --- a/pr_agent/algo/utils.py
 +++ b/pr_agent/algo/utils.py
-@@ -750,10 +750,22 @@ def _fix_key_value(key: str, value: str):
- 
- 
- def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
-+    data, _ = load_yaml_with_error(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key)
+@@ -1072,6 +1072,19 @@ def _load_yaml_initial(response_text: str) -> Any:
+ def load_yaml(response_text: str, keys_fix_yaml: list[str] | None = None, first_key="", last_key="",
+               *, preserve_null: bool = False) -> Any:
+     """Parse model output, normalizing YAML null to {} unless preservation is requested."""
++    data, _ = load_yaml_with_error(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key,
++                                   last_key=last_key, preserve_null=preserve_null)
 +    return data
 +
 +
-+def load_yaml_with_error(response_text: str, keys_fix_yaml: List[str] = [], first_key="",
-+                         last_key="") -> Tuple[Any, str]:
++def load_yaml_with_error(response_text: str, keys_fix_yaml: list[str] | None = None, first_key="", last_key="",
++                         *, preserve_null: bool = False) -> tuple[Any, str]:
 +    """load_yaml, plus the parser's own message when the answer cannot be parsed.
 +
 +    The message names the line, the column and the offending text — exactly what
 +    a caller needs to ask the model to re-serialize its own answer. Empty string
 +    means it parsed.
 +    """
+     if keys_fix_yaml is None:
+         keys_fix_yaml = []
      response_text_original = copy.deepcopy(response_text)
-     response_text = response_text.strip('\n').removeprefix('yaml').removeprefix('```yaml').rstrip().removesuffix('```')
-     try:
--        data = yaml.safe_load(response_text)
-+        return yaml.safe_load(response_text), ""
+@@ -1101,7 +1114,9 @@ def load_yaml(response_text: str, keys_fix_yaml: list[str] | None = None, first_
+         if response_text_original.strip() and not response_text.strip():
+             raise ValueError("Preprocessing/sanitization removed all content from a non-empty AI prediction")
+         data = _load_yaml_initial(response_text)
++        parse_error = ""
      except Exception as e:
++        parse_error = str(e)
          get_logger().warning(f"Initial failure to parse AI prediction: {e}")
-         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
-@@ -761,10 +773,10 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
-         if not data:
-             get_logger().error(f"Failed to parse AI prediction after fallbacks",
-                                artifact={'response_text': response_text})
--        else:
--            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
--                              artifact={'response_text': response_text})
+         separators = str.maketrans({"\u2028": " ", "\u2029": " "})
+         response_text = response_text.translate(separators)
+@@ -1114,9 +1129,10 @@ def load_yaml(response_text: str, keys_fix_yaml: list[str] | None = None, first_
+         else:
+             get_logger().info("Successfully parsed AI prediction after fallbacks",
+                               artifact={'response_text': response_text})
++            parse_error = ""
+     if data is None and not preserve_null:
+-        return {}
 -    return data
-+            return None, str(e)
-+        get_logger().info(f"Successfully parsed AI prediction after fallbacks",
-+                          artifact={'response_text': response_text})
-+        return data, ""
++        return {}, parse_error
++    return data, parse_error
  
  
  
 diff --git a/pr_agent/tools/pr_reviewer.py b/pr_agent/tools/pr_reviewer.py
-index 6e75429..757abb7 100644
+index 8661343..83314dd 100644
 --- a/pr_agent/tools/pr_reviewer.py
 +++ b/pr_agent/tools/pr_reviewer.py
-@@ -15,9 +15,10 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+@@ -64,12 +64,14 @@ from pr_agent.algo.setting_utils import _as_bool_setting
  from pr_agent.algo.skills_loader import get_skills_context
- from pr_agent.algo.repo_context import build_repo_context
- from pr_agent.algo.token_handler import TokenHandler
+ from pr_agent.algo.structural_reach import build_structural_reach
+ from pr_agent.algo.token_budget import AttemptTokenBudget
 +from pr_agent.algo.prediction_repair import repair_prediction
- from pr_agent.algo.utils import (ModelType, PRReviewHeader,
-                                  convert_to_markdown_v2, github_action_output,
--                                 load_yaml, show_relevant_configurations)
-+                                 load_yaml_with_error, show_relevant_configurations)
+ from pr_agent.algo.utils import (
+     ModelType,
+     _as_line,
+     convert_to_markdown_v2,
+     is_value_no,
+     load_yaml,
++    load_yaml_with_error,
+ )
  from pr_agent.config_loader import get_settings
- from pr_agent.git_providers import (get_git_provider,
-                                     get_git_provider_with_context)
-@@ -29,6 +30,13 @@ from pr_agent.tools.ticket_pr_compliance_check import (
-     extract_and_cache_pr_tickets, extract_tickets)
+ from pr_agent.git_providers import get_git_provider_with_context
+@@ -176,6 +178,14 @@ def _is_structural_reach_key(key) -> bool:
+     return re.sub(r"[^a-z0-9]", "", str(key).lower()) == "structuralreach"
  
  
-+# The review prediction's YAML keys — the first parse and the repair loop must
-+# agree on them, or a repaired answer parses in one place and not the other.
-+_REVIEW_YAML_KEYS = ["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:",
-+                     "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"]
-+_REVIEW_FIRST_KEY = "review"
-+_REVIEW_LAST_KEY = "security_concerns"
++# The repair prompt carries the model's own answer and the parser's verdict; it
++# needs no review context, and a short system prompt keeps the second call cheap.
++_REPAIR_SYSTEM_PROMPT = (
++    "You repair malformed structured answers. Return only the corrected document, "
++    "with no commentary and no code fences."
++)
++
 +
  class PRReviewer:
      """
      The PRReviewer class is responsible for reviewing a pull request and generating feedback using an AI model.
-@@ -237,19 +245,34 @@ class PRReviewer:
-             user=user_prompt
-         )
+@@ -1264,7 +1274,7 @@ class PRReviewer:
+         if finish_reason == "length":
+             raise FallbackEligibleError(f"Review response was truncated by {model}")
  
 -        return response
-+        return await self._repair_prediction(model, response, system_prompt)
-+
-+    def _parse_review(self, prediction: str):
-+        return load_yaml_with_error(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_KEYS,
-+                                    first_key=_REVIEW_FIRST_KEY, last_key=_REVIEW_LAST_KEY)
++        return await self._repair_prediction(model, response)
+ 
+     @staticmethod
+     def _load_review_yaml(prediction: str) -> dict:
+@@ -1274,6 +1284,38 @@ class PRReviewer:
+                                         "relevant_file:", "relevant_line:", "suggestion:"],
+                         first_key='review', last_key='security_concerns')
+ 
++    _REVIEW_YAML_KEYS = ["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "risk_level:",
++                         "merge_recommendation:", "security_concerns:", "key_issues_to_review:",
++                         "relevant_file:", "relevant_line:", "suggestion:", "existing_code:",
++                         "improved_code:"]
 +
 +    @staticmethod
-+    def _is_review(data) -> bool:
-+        return isinstance(data, dict) and bool(data.get('review'))
++    def _parse_review_with_error(prediction: str) -> tuple[object, str]:
++        return load_yaml_with_error(prediction.strip(),
++                                    keys_fix_yaml=PRReviewer._REVIEW_YAML_KEYS,
++                                    first_key='review', last_key='security_concerns')
 +
-+    async def _repair_prediction(self, model: str, response: str, system_prompt: str) -> str:
-+        """Ask the model to re-serialize an answer the parser rejected."""
++    @staticmethod
++    def _is_review(data: object) -> bool:
++        return isinstance(data, dict) and isinstance(data.get("review"), dict) and bool(data["review"])
++
++    async def _repair_prediction(self, model: str, prediction: str) -> str:
++        """Re-serialize an answer the parser rejected, from the parser's message.
++
++        Upstream detects the malformed answer and retries the whole generation on
++        the next model. This re-serializes the SAME answer, so a run with no
++        fallback model still recovers — and the findings cannot change.
++        """
 +        return await repair_prediction(
 +            self.ai_handler,
 +            model,
-+            response,
-+            system_prompt,
-+            parse=self._parse_review,
++            prediction,
++            _REPAIR_SYSTEM_PROMPT,
++            parse=self._parse_review_with_error,
 +            valid=self._is_review,
 +            temperature=get_settings().config.temperature,
 +        )
- 
-     def _prepare_pr_review(self) -> str:
-         """
-         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
-         the feedback.
-         """
--        first_key = 'review'
--        last_key = 'security_concerns'
--        data = load_yaml(self.prediction.strip(),
--                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
--                                        "relevant_file:", "relevant_line:", "suggestion:"],
--                         first_key=first_key, last_key=last_key)
-+        data, _error = self._parse_review(self.prediction)
-         github_action_output(data, 'review')
- 
-         if 'review' not in data:
++
+     def _validate_review_schema(self, data: object) -> bool:
+         is_valid = True
+         try:
 diff --git a/tests/unittest/test_prediction_repair.py b/tests/unittest/test_prediction_repair.py
 new file mode 100644
 index 0000000..0c5dd68
