@@ -52,8 +52,12 @@ jobs:
       - name: Upstream tree plus the patches
         run: |
           tag="${{ steps.base.outputs.tag }}"
+          # the patches live on this branch; the checkout below is the upstream
+          # tag, which has no patches/ — keep a copy outside the tree
+          mkdir -p "$RUNNER_TEMP/patches"
+          cp patches/*.patch "$RUNNER_TEMP/patches/"
           git checkout -q -B build "$tag"
-          git apply --3way --verbose patches/*.patch
+          git apply --3way --verbose "$RUNNER_TEMP"/patches/*.patch
 
       - uses: docker/setup-buildx-action@v3
 
