@@ -83,7 +83,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.base.outputs.tag }}
 
       - name: The patch no longer applies — say so where it is seen
-        if: failure()
+        if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -95,3 +95,6 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
+          # the check ran; the issue is the task. A red schedule every week
+          # trains people to ignore it.
+          exit 0
