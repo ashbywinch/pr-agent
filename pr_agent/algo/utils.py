@@ -750,10 +750,22 @@ def _fix_key_value(key: str, value: str):
 
 
 def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
+    data, _ = load_yaml_with_error(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key)
+    return data
+
+
+def load_yaml_with_error(response_text: str, keys_fix_yaml: List[str] = [], first_key="",
+                         last_key="") -> Tuple[Any, str]:
+    """load_yaml, plus the parser's own message when the answer cannot be parsed.
+
+    The message names the line, the column and the offending text — exactly what
+    a caller needs to ask the model to re-serialize its own answer. Empty string
+    means it parsed.
+    """
     response_text_original = copy.deepcopy(response_text)
     response_text = response_text.strip('\n').removeprefix('yaml').removeprefix('```yaml').rstrip().removesuffix('```')
     try:
-        data = yaml.safe_load(response_text)
+        return yaml.safe_load(response_text), ""
     except Exception as e:
         get_logger().warning(f"Initial failure to parse AI prediction: {e}")
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
@@ -761,10 +773,10 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
         if not data:
             get_logger().error(f"Failed to parse AI prediction after fallbacks",
                                artifact={'response_text': response_text})
-        else:
-            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
-                              artifact={'response_text': response_text})
-    return data
+            return None, str(e)
+        get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+                          artifact={'response_text': response_text})
+        return data, ""
 
 
 

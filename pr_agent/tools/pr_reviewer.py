@@ -15,9 +15,10 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.token_handler import TokenHandler
+from pr_agent.algo.prediction_repair import repair_prediction
 from pr_agent.algo.utils import (ModelType, PRReviewHeader,
                                  convert_to_markdown_v2, github_action_output,
-                                 load_yaml, show_relevant_configurations)
+                                 load_yaml_with_error, show_relevant_configurations)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (get_git_provider,
                                     get_git_provider_with_context)
@@ -28,6 +29,13 @@ from pr_agent.servers.help import HelpMessage
 from pr_agent.tools.ticket_pr_compliance_check import (
     extract_and_cache_pr_tickets, extract_tickets)
 
+
+# The review prediction's YAML keys — the first parse and the repair loop must
+# agree on them, or a repaired answer parses in one place and not the other.
+_REVIEW_YAML_KEYS = ["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:",
+                     "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"]
+_REVIEW_FIRST_KEY = "review"
+_REVIEW_LAST_KEY = "security_concerns"
 
 class PRReviewer:
     """
@@ -237,19 +245,34 @@ class PRReviewer:
             user=user_prompt
         )
 
-        return response
+        return await self._repair_prediction(model, response, system_prompt)
+
+    def _parse_review(self, prediction: str):
+        return load_yaml_with_error(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_KEYS,
+                                    first_key=_REVIEW_FIRST_KEY, last_key=_REVIEW_LAST_KEY)
+
+    @staticmethod
+    def _is_review(data) -> bool:
+        return isinstance(data, dict) and bool(data.get('review'))
+
+    async def _repair_prediction(self, model: str, response: str, system_prompt: str) -> str:
+        """Ask the model to re-serialize an answer the parser rejected."""
+        return await repair_prediction(
+            self.ai_handler,
+            model,
+            response,
+            system_prompt,
+            parse=self._parse_review,
+            valid=self._is_review,
+            temperature=get_settings().config.temperature,
+        )
 
     def _prepare_pr_review(self) -> str:
         """
         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
         the feedback.
         """
-        first_key = 'review'
-        last_key = 'security_concerns'
-        data = load_yaml(self.prediction.strip(),
-                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
-                                        "relevant_file:", "relevant_line:", "suggestion:"],
-                         first_key=first_key, last_key=last_key)
+        data, _error = self._parse_review(self.prediction)
         github_action_output(data, 'review')
 
         if 'review' not in data:
