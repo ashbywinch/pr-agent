@@ -71,7 +71,10 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.github_action
+          # upstream's multi-stage Dockerfile has the action's stage; the
+          # build-from-source Dockerfile of v0.41 no longer exists
+          file: docker/Dockerfile
+          target: github_action
           push: true
           # `github_action` moves with each successful build; the versioned tag
           # is what a consumer pins when it wants a fixed image.
