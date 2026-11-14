@@ -1,0 +1,298 @@
+diff --git a/pr_agent/algo/prediction_repair.py b/pr_agent/algo/prediction_repair.py
+new file mode 100644
+index 0000000..9c3374f
+--- /dev/null
++++ b/pr_agent/algo/prediction_repair.py
+@@ -0,0 +1,79 @@
++"""Repair a prediction the parser rejected, by handing the model its own answer.
++
++The model is asked to serialize its answer (YAML for the review), and it
++sometimes writes a plain scalar where the format needs a block scalar — an
++unquoted colon inside prose is the usual case. Parsing then fails on text the
++model itself produced, and re-rolling the same request just draws again.
++
++The parser's message names the line, the column and the offending text, which
++is exactly the correction the model needs. This module owns that loop: parse,
++hand back the answer and the error, parse again, bounded.
++"""
++
++from typing import Any, Callable, Tuple
++
++
++def _logger():
++    """pr_agent.log imports config_loader, which imports back into it — a
++    top-level import here fails when this module is the first one loaded."""
++    from pr_agent.log import get_logger
++
++    return get_logger()
++
++# Two attempts: the first usually corrects it, and a model that has not by the
++# second is not going to.
++MAX_REPAIR_ATTEMPTS = 2
++
++
++def repair_prompt(previous: str, error: str) -> str:
++    """The message that hands the model its own answer and the parser's verdict."""
++    return (
++        "Your previous answer could not be parsed as YAML.\n"
++        f"The parser said: {error}\n"
++        "Here is your previous answer:\n"
++        f"{previous}\n"
++        "Return the SAME content as valid YAML. Keep every finding, header and value identical — "
++        "only the serialization changes. Wrap every prose value in a `|` block scalar: a plain "
++        "value containing a colon is what failed. No commentary, no code fences."
++    )
++
++
++async def repair_prediction(
++    handler,
++    model: str,
++    response: str,
++    system_prompt: str,
++    parse: Callable[[str], Tuple[Any, str]],
++    valid: Callable[[Any], bool],
++    temperature: float = 0.2,
++    max_attempts: int = MAX_REPAIR_ATTEMPTS,
++) -> str:
++    """Return `response`, or the model's re-serialized version of it.
++
++    `parse` returns (data, error) with an empty error when the text parsed;
++    `valid` says whether the parsed data carries what the caller needs. The loop
++    stops on success, on a repeated answer (the model has nothing new to say),
++    or when the attempts run out — the caller then reports the failure it would
++    have reported anyway.
++    """
++    data, error = parse(response)
++    if not error and valid(data):
++        return response
++    for _attempt in range(max_attempts):
++        repaired, _finish = await handler.chat_completion(
++            model=model,
++            temperature=temperature,
++            system=system_prompt,
++            user=repair_prompt(response, error),
++        )
++        if repaired.strip() == response.strip():
++            _logger().warning("Prediction repair returned the same text; stopping")
++            break
++        data, error = parse(repaired)
++        if not error and valid(data):
++            _logger().info("Recovered a malformed prediction by repairing its YAML")
++            return repaired
++        response = repaired
++    _logger().warning("Prediction still unparseable after repair",
++                         artifact={'response_text': response})
++    return response
+diff --git a/pr_agent/algo/utils.py b/pr_agent/algo/utils.py
+index 35bf9e0..f7a24f3 100644
+--- a/pr_agent/algo/utils.py
++++ b/pr_agent/algo/utils.py
+@@ -750,10 +750,22 @@ def _fix_key_value(key: str, value: str):
+ 
+ 
+ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
++    data, _ = load_yaml_with_error(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key)
++    return data
++
++
++def load_yaml_with_error(response_text: str, keys_fix_yaml: List[str] = [], first_key="",
++                         last_key="") -> Tuple[Any, str]:
++    """load_yaml, plus the parser's own message when the answer cannot be parsed.
++
++    The message names the line, the column and the offending text — exactly what
++    a caller needs to ask the model to re-serialize its own answer. Empty string
++    means it parsed.
++    """
+     response_text_original = copy.deepcopy(response_text)
+     response_text = response_text.strip('\n').removeprefix('yaml').removeprefix('```yaml').rstrip().removesuffix('```')
+     try:
+-        data = yaml.safe_load(response_text)
++        return yaml.safe_load(response_text), ""
+     except Exception as e:
+         get_logger().warning(f"Initial failure to parse AI prediction: {e}")
+         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
+@@ -761,10 +773,10 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
+         if not data:
+             get_logger().error(f"Failed to parse AI prediction after fallbacks",
+                                artifact={'response_text': response_text})
+-        else:
+-            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+-                              artifact={'response_text': response_text})
+-    return data
++            return None, str(e)
++        get_logger().info(f"Successfully parsed AI prediction after fallbacks",
++                          artifact={'response_text': response_text})
++        return data, ""
+ 
+ 
+ 
+diff --git a/pr_agent/tools/pr_reviewer.py b/pr_agent/tools/pr_reviewer.py
+index 6e75429..757abb7 100644
+--- a/pr_agent/tools/pr_reviewer.py
++++ b/pr_agent/tools/pr_reviewer.py
+@@ -15,9 +15,10 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+ from pr_agent.algo.skills_loader import get_skills_context
+ from pr_agent.algo.repo_context import build_repo_context
+ from pr_agent.algo.token_handler import TokenHandler
++from pr_agent.algo.prediction_repair import repair_prediction
+ from pr_agent.algo.utils import (ModelType, PRReviewHeader,
+                                  convert_to_markdown_v2, github_action_output,
+-                                 load_yaml, show_relevant_configurations)
++                                 load_yaml_with_error, show_relevant_configurations)
+ from pr_agent.config_loader import get_settings
+ from pr_agent.git_providers import (get_git_provider,
+                                     get_git_provider_with_context)
+@@ -29,6 +30,13 @@ from pr_agent.tools.ticket_pr_compliance_check import (
+     extract_and_cache_pr_tickets, extract_tickets)
+ 
+ 
++# The review prediction's YAML keys — the first parse and the repair loop must
++# agree on them, or a repaired answer parses in one place and not the other.
++_REVIEW_YAML_KEYS = ["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:",
++                     "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"]
++_REVIEW_FIRST_KEY = "review"
++_REVIEW_LAST_KEY = "security_concerns"
++
+ class PRReviewer:
+     """
+     The PRReviewer class is responsible for reviewing a pull request and generating feedback using an AI model.
+@@ -237,19 +245,34 @@ class PRReviewer:
+             user=user_prompt
+         )
+ 
+-        return response
++        return await self._repair_prediction(model, response, system_prompt)
++
++    def _parse_review(self, prediction: str):
++        return load_yaml_with_error(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_KEYS,
++                                    first_key=_REVIEW_FIRST_KEY, last_key=_REVIEW_LAST_KEY)
++
++    @staticmethod
++    def _is_review(data) -> bool:
++        return isinstance(data, dict) and bool(data.get('review'))
++
++    async def _repair_prediction(self, model: str, response: str, system_prompt: str) -> str:
++        """Ask the model to re-serialize an answer the parser rejected."""
++        return await repair_prediction(
++            self.ai_handler,
++            model,
++            response,
++            system_prompt,
++            parse=self._parse_review,
++            valid=self._is_review,
++            temperature=get_settings().config.temperature,
++        )
+ 
+     def _prepare_pr_review(self) -> str:
+         """
+         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
+         the feedback.
+         """
+-        first_key = 'review'
+-        last_key = 'security_concerns'
+-        data = load_yaml(self.prediction.strip(),
+-                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
+-                                        "relevant_file:", "relevant_line:", "suggestion:"],
+-                         first_key=first_key, last_key=last_key)
++        data, _error = self._parse_review(self.prediction)
+         github_action_output(data, 'review')
+ 
+         if 'review' not in data:
+diff --git a/tests/unittest/test_prediction_repair.py b/tests/unittest/test_prediction_repair.py
+new file mode 100644
+index 0000000..0c5dd68
+--- /dev/null
++++ b/tests/unittest/test_prediction_repair.py
+@@ -0,0 +1,92 @@
++"""A malformed prediction is handed back to the model with the parser's error."""
++
++import asyncio
++
++# the package's import order: pr_agent.log imports config_loader, which imports
++# back into it — importing config_loader first is how every entry point does it
++import pr_agent.config_loader  # noqa: F401
++
++from pr_agent.algo.prediction_repair import repair_prediction
++
++MALFORMED = """review:
++  security_concerns: |
++    No
++  key_issues_to_review:
++    - relevant_file: |
++        a.py
++      issue_content: The fixture demonstrates this: two singletons are scattered
++"""
++
++REPAIRED = """review:
++  security_concerns: |
++    No
++  key_issues_to_review:
++    - relevant_file: |
++        a.py
++      issue_content: |
++        The fixture demonstrates this: two singletons are scattered
++"""
++
++
++class _FakeHandler:
++    def __init__(self, responses):
++        self.responses = list(responses)
++        self.calls = []
++
++    async def chat_completion(self, model, system, user, temperature=0.2, img_path=None):
++        self.calls.append(user)
++        return self.responses.pop(0), "stop"
++
++
++def _parse(text):
++    """The reviewer's parse, reduced to what the loop needs: data, error."""
++    import yaml
++
++    try:
++        data = yaml.safe_load(text)
++    except Exception as e:  # the parser's message names line and column
++        return None, str(e)
++    return data, ""
++
++
++def _valid(data):
++    return isinstance(data, dict) and bool(data.get("review"))
++
++
++def _run(responses, response):
++    handler = _FakeHandler(responses)
++    out = asyncio.run(
++        repair_prediction(handler, "m", response, "system", parse=_parse, valid=_valid)
++    )
++    return out, handler
++
++
++def test_a_valid_prediction_is_not_sent_back():
++    out, handler = _run([], REPAIRED)
++    assert out == REPAIRED
++    assert handler.calls == []
++
++
++def test_a_malformed_prediction_is_repaired_with_the_parser_error():
++    out, handler = _run([REPAIRED], MALFORMED)
++    assert out == REPAIRED
++    assert len(handler.calls) == 1
++    prompt = handler.calls[0]
++    assert "could not be parsed as YAML" in prompt
++    assert "line" in prompt and "column" in prompt  # the parser's verdict
++    assert "demonstrates this" in prompt  # the model's own answer
++    assert "SAME content" in prompt
++
++
++def test_a_repeated_answer_ends_the_loop():
++    out, handler = _run([MALFORMED], MALFORMED)
++    assert out == MALFORMED
++    assert len(handler.calls) == 1  # no second draw
++
++
++def test_a_second_bad_answer_still_stops_after_the_bound():
++    # a DIFFERENT malformed answer each time: the loop draws twice, then stops
++    other_bad = MALFORMED.replace("a.py", "b.py")
++    out, handler = _run([other_bad, other_bad + "\n"], MALFORMED)
++    assert len(handler.calls) == 2
++    assert out != REPAIRED
