@@ -27,6 +27,7 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  issues: write
 
 jobs:
   build:
@@ -80,3 +81,17 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.base.outputs.tag }}
+
+      - name: The patch no longer applies — say so where it is seen
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="image: the patches do not apply to ${{ steps.base.outputs.tag }}"
+          body="The weekly rebuild could not apply \`patches/*.patch\` to \`${{ steps.base.outputs.tag }}\`. The published tag was not moved, so consumers still run the last good image. Adapt the patch in \`patches/\` against that tag, then re-run this workflow."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
