@@ -22,10 +22,13 @@ repos:
       - id: debug-statements
       - id: destroyed-symlinks
       - id: end-of-file-fixer
+        exclude: ^patches/.*\.patch$ # a patch ends where the diff ends
       - id: mixed-line-ending
         args: ["--fix=lf"]
       - id: trailing-whitespace
-        exclude: ^tests/unittest/test_extend_patch\.py$ # trailing space; stripping it breaks the test.
+        # A patch's context line for a blank line is a single space, and a
+        # zero-byte context line is invalid: stripping either breaks `git apply`.
+        exclude: ^(tests/unittest/test_extend_patch\.py|patches/.*\.patch)$
 
   - repo: https://github.com/rhysd/actionlint
     rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
