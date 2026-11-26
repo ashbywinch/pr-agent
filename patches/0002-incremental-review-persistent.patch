@@ -1,0 +1,30 @@
+diff --git a/pr_agent/tools/pr_reviewer.py b/pr_agent/tools/pr_reviewer.py
+index 8661343..78599c0 100644
+--- a/pr_agent/tools/pr_reviewer.py
++++ b/pr_agent/tools/pr_reviewer.py
+@@ -445,14 +445,22 @@ class PRReviewer:
+                     self._as_non_authoritative_review(pr_review),
+                     **review_thread_kwargs,
+                 )
+-            elif get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
++            elif get_settings().pr_reviewer.persistent_comment:
+                 final_update_message = get_settings().pr_reviewer.final_update_message
++                # An incremental review updates its own comment instead of
++                # posting a new one: without this, every push adds another
++                # "Incremental PR Reviewer Guide" to the PR.
++                incremental_review = self.incremental.is_incremental
+                 persistent_args = dict(
+                     initial_header=pr_review.split("\n", 1)[0],
+                     update_header=True,
+                     final_update_message=final_update_message,
+-                    identity_marker=PRReviewIdentity.REGULAR.value,
+-                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
++                    identity_marker=(PRReviewIdentity.INCREMENTAL.value
++                                     if incremental_review
++                                     else PRReviewIdentity.REGULAR.value),
++                    legacy_initial_header=(
++                        f"{PRReviewHeader.INCREMENTAL.value} 🔍" if incremental_review
++                        else f"{PRReviewHeader.REGULAR.value} 🔍"),
+                     **review_thread_kwargs,
+                 )
+                 if not self._review_finding_state_in_play():
